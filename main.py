@@ -219,7 +219,6 @@ async def product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer()
     try:
         product_id = int(q.data.split(":", 1)[1])
     except (ValueError, IndexError):
@@ -284,6 +283,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             VALUES(?, ?, 'purchase', ?, ?)
         """, (q.from_user.id, -current["price"], f"Order #{order_id}", now()))
 
+    await q.answer("Order placed successfully.")
     await q.edit_message_text(
         f"<b>Order placed successfully</b>\n\n"
         f"Order ID: <code>#{order_id}</code>\n"
