@@ -1,0 +1,12 @@
+app = "casealtbot"
+primary_region = "sin"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DB_PATH = "/app/store.db"
+  CURRENCY = "Rs."
+
+[processes]
+  app = "python main.py"
