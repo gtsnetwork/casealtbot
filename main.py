@@ -11,7 +11,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9220656447:AAHyEiacVALvPLsL7OOFniX3AyW2kUuIO50").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "9220656447:AAGWWP5rxx9MuF_X9nyYhfg-PG1XbQM8Pec").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8480522053"))
 BOT_NAME = "CaseAltBot"
 BRAND = "Powered by GTS Network"
