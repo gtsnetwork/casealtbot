@@ -357,7 +357,7 @@ async def topup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Main Menu", callback_data="home")]
     ])
     await q.edit_message_text(
-        "<b>Add Funds to Your Wallet</b>\\n\\nChoose a payment method. Submit your paid amount and UTR / transaction hash. Wallet credit is subject to admin verification.",
+        "<b>Add Funds to Your Wallet</b>\n\nChoose a payment method. Submit your paid amount and UTR / transaction hash. Wallet credit is subject to admin verification.",
         parse_mode=ParseMode.HTML, reply_markup=keyboard
     )
 
@@ -369,10 +369,10 @@ async def payment_method_callback(update: Update, context: ContextTypes.DEFAULT_
     context.user_data["payment_request"] = {"currency": currency, "step": "amount"}
     if currency == "INR":
         data = UPI_QR_DATA
-        caption = f"<b>UPI · INR</b>\\nUPI ID: <code>{UPI_ID}</code>\\nScan to pay, then enter the amount paid."
+        caption = f"<b>UPI · INR</b>\nUPI ID: <code>{UPI_ID}</code>\nScan to pay, then enter the amount paid."
     else:
         data = USDT_BEP20_ADDRESS
-        caption = f"<b>USDT · BNB Smart Chain (BEP20)</b>\\n<code>{USDT_BEP20_ADDRESS}</code>\\nSend USDT on BNB Smart Chain only, then enter the amount paid."
+        caption = f"<b>USDT · BNB Smart Chain (BEP20)</b>\n<code>{USDT_BEP20_ADDRESS}</code>\nSend USDT on BNB Smart Chain only, then enter the amount paid."
     await q.message.reply_photo(make_qr(data), caption=caption, parse_mode=ParseMode.HTML)
     await q.message.reply_text("Enter the amount you paid (numbers only, e.g. 500 or 10.5).")
     await q.edit_message_text("Payment instructions sent. Complete payment and reply with the amount.", reply_markup=back_menu())
@@ -404,12 +404,12 @@ async def payment_message_handler(update: Update, context: ContextTypes.DEFAULT_
         payment_id = cur.lastrowid
     context.user_data.pop("payment_request", None)
     await update.effective_message.reply_text(
-        f"<b>Payment submitted</b>\\nRequest: <code>#{payment_id}</code>\\nPaid: {amount:g} {currency}\\nStatus: Pending verification.",
+        f"<b>Payment submitted</b>\nRequest: <code>#{payment_id}</code>\nPaid: {amount:g} {currency}\nStatus: Pending verification.",
         parse_mode=ParseMode.HTML, reply_markup=back_menu()
     )
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Approve INR payment", callback_data=f"payapprove:{payment_id}"), InlineKeyboardButton("Reject", callback_data=f"payreject:{payment_id}")]])
     try:
-        await context.bot.send_message(ADMIN_ID, f"PAYMENT REQUEST #{payment_id}\\nUser: {update.effective_user.id}\\nMethod: {currency}\\nPaid: {amount:g} {currency}\\nReference: {raw}\\n" + ("Verify BEP20 transaction, then use /creditpayment ID INR_AMOUNT." if currency == "USDT" else "Verify UPI UTR before approval."), reply_markup=keyboard)
+        await context.bot.send_message(ADMIN_ID, f"PAYMENT REQUEST #{payment_id}\nUser: {update.effective_user.id}\nMethod: {currency}\nPaid: {amount:g} {currency}\nReference: {raw}\n" + ("Verify BEP20 transaction, then use /creditpayment ID INR_AMOUNT." if currency == "USDT" else "Verify UPI UTR before approval."), reply_markup=keyboard)
     except Exception:
         log.exception("Could not notify admin about payment request %s", payment_id)
 
