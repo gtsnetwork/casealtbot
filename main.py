@@ -6,6 +6,9 @@ from functools import wraps
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
+from telegram.ext import MessageHandler, filters
+from io import BytesIO
+import qrcode
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes,
@@ -16,7 +19,11 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "8480522053"))
 BOT_NAME = "CaseAltBot"
 BRAND = "Powered by GTS Network"
 DB_PATH = os.getenv("DB_PATH", "store.db")
-CURRENCY = os.getenv("CURRENCY", "Rs.")
+CURRENCY = os.getenv("CURRENCY", "₹")
+UPI_ID = "aman292011@fam"
+UPI_QR_DATA = "upi://pay?pa=aman292011@fam"
+USDT_BEP20_ADDRESS = "0x3979A76B7684ad7ea8BDDbafb1E1b95771391D61"
+SUPPORT_URL = "https://t.me/gtsuser"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -76,6 +83,17 @@ def init_db():
             kind TEXT NOT NULL,
             note TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS payment_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            currency TEXT NOT NULL CHECK(currency IN ('INR','USDT')),
+            paid_amount REAL NOT NULL,
+            reference TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            credited_inr REAL,
+            created_at TEXT NOT NULL,
+            reviewed_at TEXT
         );
         """)
     log.info("Database initialized")
@@ -317,16 +335,140 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def make_qr(data):
+    qr = qrcode.QRCode(box_size=8, border=3)
+    qr.add_data(data)
+    qr.make(fit=True)
+    image = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    bio = BytesIO()
+    bio.name = "payment_qr.png"
+    image.save(bio, "PNG")
+    bio.seek(0)
+    return bio
+
+
 async def topup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    context.user_data.pop("payment_request", None)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Pay with UPI · INR", callback_data="paymethod:INR")],
+        [InlineKeyboardButton("Pay with USDT · BEP20", callback_data="paymethod:USDT")],
+        [InlineKeyboardButton("Main Menu", callback_data="home")]
+    ])
     await q.edit_message_text(
-        "To request a wallet top-up, contact the administrator and include your Telegram user ID:\n"
-        f"<code>{q.from_user.id}</code>\n\n"
-        "Top-ups are credited only after the administrator verifies payment.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=back_menu(),
+        "<b>Add Funds to Your Wallet</b>\\n\\nChoose a payment method. Submit your paid amount and UTR / transaction hash. Wallet credit is subject to admin verification.",
+        parse_mode=ParseMode.HTML, reply_markup=keyboard
     )
+
+
+async def payment_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    currency = q.data.split(":", 1)[1]
+    context.user_data["payment_request"] = {"currency": currency, "step": "amount"}
+    if currency == "INR":
+        data = UPI_QR_DATA
+        caption = f"<b>UPI · INR</b>\\nUPI ID: <code>{UPI_ID}</code>\\nScan to pay, then enter the amount paid."
+    else:
+        data = USDT_BEP20_ADDRESS
+        caption = f"<b>USDT · BNB Smart Chain (BEP20)</b>\\n<code>{USDT_BEP20_ADDRESS}</code>\\nSend USDT on BNB Smart Chain only, then enter the amount paid."
+    await q.message.reply_photo(make_qr(data), caption=caption, parse_mode=ParseMode.HTML)
+    await q.message.reply_text("Enter the amount you paid (numbers only, e.g. 500 or 10.5).")
+    await q.edit_message_text("Payment instructions sent. Complete payment and reply with the amount.", reply_markup=back_menu())
+
+
+async def payment_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    state = context.user_data.get("payment_request")
+    if not state:
+        return
+    raw = (update.effective_message.text or "").strip()
+    if state["step"] == "amount":
+        try:
+            amount = float(raw)
+            if amount <= 0 or amount > 100000000:
+                raise ValueError
+        except ValueError:
+            await update.effective_message.reply_text("Enter a valid positive amount.")
+            return
+        state["amount"] = amount
+        state["step"] = "reference"
+        await update.effective_message.reply_text("Now send your UTR / transaction reference or blockchain transaction hash.")
+        return
+    if len(raw) < 4 or len(raw) > 180:
+        await update.effective_message.reply_text("Please send a valid transaction reference.")
+        return
+    currency, amount = state["currency"], state["amount"]
+    with connect() as conn:
+        cur = conn.execute("INSERT INTO payment_requests(user_id,currency,paid_amount,reference,created_at) VALUES(?,?,?,?,?)", (update.effective_user.id, currency, amount, raw, now()))
+        payment_id = cur.lastrowid
+    context.user_data.pop("payment_request", None)
+    await update.effective_message.reply_text(
+        f"<b>Payment submitted</b>\\nRequest: <code>#{payment_id}</code>\\nPaid: {amount:g} {currency}\\nStatus: Pending verification.",
+        parse_mode=ParseMode.HTML, reply_markup=back_menu()
+    )
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Approve INR payment", callback_data=f"payapprove:{payment_id}"), InlineKeyboardButton("Reject", callback_data=f"payreject:{payment_id}")]])
+    try:
+        await context.bot.send_message(ADMIN_ID, f"PAYMENT REQUEST #{payment_id}\\nUser: {update.effective_user.id}\\nMethod: {currency}\\nPaid: {amount:g} {currency}\\nReference: {raw}\\n" + ("Verify BEP20 transaction, then use /creditpayment ID INR_AMOUNT." if currency == "USDT" else "Verify UPI UTR before approval."), reply_markup=keyboard)
+    except Exception:
+        log.exception("Could not notify admin about payment request %s", payment_id)
+
+
+@admin_only
+async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    action, raw_id = q.data.split(":", 1)
+    payment_id = int(raw_id)
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        payment = conn.execute("SELECT * FROM payment_requests WHERE id=?", (payment_id,)).fetchone()
+        if not payment or payment["status"] != "pending":
+            conn.rollback()
+            await q.answer("Already reviewed or not found.", show_alert=True)
+            return
+        if action == "payapprove" and payment["currency"] == "USDT":
+            conn.rollback()
+            await q.answer("Verify transfer, then use /creditpayment ID INR_AMOUNT.", show_alert=True)
+            return
+        credit = payment["paid_amount"] if action == "payapprove" else None
+        status = "approved" if credit is not None else "rejected"
+        if credit is not None:
+            conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (credit, payment["user_id"]))
+            conn.execute("INSERT INTO wallet_transactions(user_id,amount,kind,note,created_at) VALUES(?,?,'payment_credit',?,?)", (payment["user_id"], credit, f"Verified UPI payment #{payment_id}", now()))
+        conn.execute("UPDATE payment_requests SET status=?,credited_inr=?,reviewed_at=? WHERE id=?", (status, credit, now(), payment_id))
+    await q.answer(status.title())
+    await q.edit_message_text(f"Payment request #{payment_id}: {status.upper()}.")
+    try:
+        msg = f"Payment #{payment_id} approved. {money(credit)} added to your wallet." if credit is not None else f"Payment #{payment_id} rejected. Contact support if needed."
+        await context.bot.send_message(payment["user_id"], msg)
+    except Exception:
+        log.exception("Could not notify user about payment review")
+
+
+@admin_only
+async def credit_usdt_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Usage: /creditpayment PAYMENT_ID INR_AMOUNT")
+        return
+    try:
+        payment_id, credit = int(context.args[0]), float(context.args[1])
+        if credit <= 0:
+            raise ValueError
+    except ValueError:
+        await update.effective_message.reply_text("Enter a valid payment ID and INR credit amount.")
+        return
+    with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        payment = conn.execute("SELECT * FROM payment_requests WHERE id=? AND currency='USDT' AND status='pending'", (payment_id,)).fetchone()
+        if not payment:
+            conn.rollback()
+            await update.effective_message.reply_text("Pending USDT request not found.")
+            return
+        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (credit, payment["user_id"]))
+        conn.execute("INSERT INTO wallet_transactions(user_id,amount,kind,note,created_at) VALUES(?,?,'payment_credit',?,?)", (payment["user_id"], credit, f"Verified USDT payment #{payment_id}", now()))
+        conn.execute("UPDATE payment_requests SET status='approved',credited_inr=?,reviewed_at=? WHERE id=?", (credit, now(), payment_id))
+    await update.effective_message.reply_text(f"USDT request #{payment_id} verified. {money(credit)} credited.")
+    await context.bot.send_message(payment["user_id"], f"USDT payment #{payment_id} approved. {money(credit)} added to your wallet.")
 
 
 async def orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -354,8 +496,8 @@ async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
-        "For order or wallet support, contact the administrator.",
-        reply_markup=back_menu(),
+        "For order or wallet support, contact GTS Network Support.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Contact Support", url=SUPPORT_URL)], [InlineKeyboardButton("Main Menu", callback_data="home")]]),
     )
 
 
@@ -627,6 +769,10 @@ def main():
     app.add_handler(CommandHandler("orders", list_orders))
     app.add_handler(CommandHandler("fulfill", fulfill_order))
     app.add_handler(CommandHandler("cancelorder", cancel_order))
+    app.add_handler(CommandHandler("creditpayment", credit_usdt_payment))
+    app.add_handler(CallbackQueryHandler(payment_method_callback, pattern="^paymethod:"))
+    app.add_handler(CallbackQueryHandler(payment_review_callback, pattern="^payapprove:|^payreject:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, payment_message_handler))
 
     app.add_handler(CallbackQueryHandler(home_callback, pattern="^home$"))
     app.add_handler(CallbackQueryHandler(shop_callback, pattern="^shop$"))
