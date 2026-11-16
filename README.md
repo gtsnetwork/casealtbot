@@ -9,6 +9,8 @@ A Telegram storefront with a SQLite-backed wallet, product catalogue, stock coun
 - Atomic wallet debit and stock reservation when an order is placed
 - Admin order review, fulfilment status and cancellation/refund
 - Admin wallet adjustments
+- INR UPI and USDT (BNB Smart Chain / BEP20) payment requests
+- Payment-reference submission and admin verification before wallet credit
 - SQLite database with WAL mode
 
 This version records orders and supports admin-controlled fulfilment. It does not collect or distribute third-party account passwords, login codes, session strings or authentication tokens.
@@ -35,6 +37,7 @@ Do not commit your real bot token or the SQLite database.
 - `/orders`
 - `/fulfill ORDER_ID`
 - `/cancelorder ORDER_ID` — refunds wallet and restores stock
+- `/creditpayment PAYMENT_ID INR_AMOUNT` — approve a verified USDT payment and credit the chosen INR wallet amount
 
 ### Example product
 
