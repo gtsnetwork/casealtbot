@@ -1,17 +1,21 @@
 import os
+import re
 import logging
 import sqlite3
 from datetime import datetime, timezone
 from functools import wraps
+from io import BytesIO
 
+import qrcode
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
-from telegram.ext import MessageHandler, filters
-from io import BytesIO
-import qrcode
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -20,6 +24,8 @@ BOT_NAME = "CaseAltBot"
 BRAND = "Powered by GTS Network"
 DB_PATH = os.getenv("DB_PATH", "store.db")
 CURRENCY = os.getenv("CURRENCY", "₹")
+
+# Existing payment configuration retained.
 UPI_ID = "aman292011@fam"
 UPI_QR_DATA = "upi://pay?pa=aman292011@fam"
 USDT_BEP20_ADDRESS = "0x3979A76B7684ad7ea8BDDbafb1E1b95771391D61"
@@ -95,8 +101,52 @@ def init_db():
             created_at TEXT NOT NULL,
             reviewed_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS inventory_numbers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_id INTEGER NOT NULL,
+            phone_number TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'available'
+                CHECK(status IN ('available','reserved','sold')),
+            order_id INTEGER UNIQUE,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(product_id) REFERENCES products(id),
+            FOREIGN KEY(order_id) REFERENCES orders(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_inventory_product_status
+            ON inventory_numbers(product_id, status);
+        CREATE TABLE IF NOT EXISTS bot_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """)
     log.info("Database initialized")
+
+
+def maintenance_enabled():
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key='maintenance'"
+        ).fetchone()
+    return bool(row and row["value"] == "on")
+
+
+async def block_for_maintenance(query):
+    if query.from_user.id != ADMIN_ID and maintenance_enabled():
+        await query.answer(
+            "The bot is temporarily under maintenance. Please try again later.",
+            show_alert=True,
+        )
+        try:
+            await query.edit_message_text(
+                f"<b>{BOT_NAME} is under maintenance</b>\n\n"
+                "We are making improvements. Please try again later.\n\n"
+                f"<i>{BRAND}</i>",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        return True
+    return False
 
 
 def register_user(tg_user):
@@ -112,7 +162,9 @@ def register_user(tg_user):
 
 def get_user(user_id):
     with connect() as conn:
-        return conn.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return conn.execute(
+            "SELECT * FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
 
 
 def money(value):
@@ -134,7 +186,9 @@ def main_menu():
 
 
 def back_menu():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Main Menu", callback_data="home")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Main Menu", callback_data="home")]
+    ])
 
 
 def admin_only(func):
@@ -142,7 +196,9 @@ def admin_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user or update.effective_user.id != ADMIN_ID:
             if update.callback_query:
-                await update.callback_query.answer("Admin access only.", show_alert=True)
+                await update.callback_query.answer(
+                    "Admin access only.", show_alert=True
+                )
             elif update.effective_message:
                 await update.effective_message.reply_text("Admin access only.")
             return
@@ -151,6 +207,12 @@ def admin_only(func):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID and maintenance_enabled():
+        await update.effective_message.reply_text(
+            f"{BOT_NAME} is temporarily under maintenance. "
+            f"Please try again later.\n\n{BRAND}"
+        )
+        return
     register_user(update.effective_user)
     msg = (
         f"<b>Welcome to {BOT_NAME}</b>\n"
@@ -164,6 +226,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     await q.answer()
     register_user(q.from_user)
     await q.edit_message_text(
@@ -175,6 +239,8 @@ async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     await q.answer()
     with connect() as conn:
         products = conn.execute(
@@ -190,8 +256,16 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows = []
     for p in products:
-        label = f"{p['name']} · {money(p['price'])} · Stock: {p['stock']}"
-        rows.append([InlineKeyboardButton(label[:60], callback_data=f"product:{p['id']}")])
+        with connect() as conn:
+            available = conn.execute(
+                "SELECT COUNT(*) FROM inventory_numbers "
+                "WHERE product_id=? AND status='available'",
+                (p["id"],),
+            ).fetchone()[0]
+        label = f"{p['name']} · {money(p['price'])} · Stock: {available}"
+        rows.append([
+            InlineKeyboardButton(label[:60], callback_data=f"product:{p['id']}")
+        ])
     rows.append([InlineKeyboardButton("Main Menu", callback_data="home")])
     await q.edit_message_text(
         "<b>Available Products</b>\nSelect a product to view its details:",
@@ -202,6 +276,8 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     await q.answer()
     try:
         product_id = int(q.data.split(":", 1)[1])
@@ -213,100 +289,118 @@ async def product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         p = conn.execute(
             "SELECT * FROM products WHERE id=? AND active=1", (product_id,)
         ).fetchone()
+        available = conn.execute(
+            "SELECT COUNT(*) FROM inventory_numbers "
+            "WHERE product_id=? AND status='available'",
+            (product_id,),
+        ).fetchone()[0]
 
     if not p:
-        await q.edit_message_text("This product is no longer available.", reply_markup=back_menu())
+        await q.edit_message_text(
+            "This product is no longer available.", reply_markup=back_menu()
+        )
         return
 
     text = (
         f"<b>{p['name']}</b>\n"
         f"Category: {p['category']}\n"
         f"Price: {money(p['price'])}\n"
-        f"Available quantity: {p['stock']}\n\n"
+        f"Available quantity: {available}\n\n"
         f"{p['description'] or 'No additional description.'}\n\n"
         "Orders are placed from your wallet and are reviewed by the administrator."
     )
     buttons = []
-    if p["stock"] > 0:
-        buttons.append([InlineKeyboardButton("Place Order", callback_data=f"buy:{p['id']}")])
+    if available > 0:
+        buttons.append([
+            InlineKeyboardButton("Place Order", callback_data=f"buy:{p['id']}")
+        ])
     buttons.append([InlineKeyboardButton("Back to Shop", callback_data="shop")])
     await q.edit_message_text(
-        text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons)
+        text, parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     try:
         product_id = int(q.data.split(":", 1)[1])
     except (ValueError, IndexError):
         await q.answer("Invalid product.", show_alert=True)
         return
 
-    with connect() as conn:
-        p = conn.execute(
-            "SELECT * FROM products WHERE id=? AND active=1", (product_id,)
-        ).fetchone()
-    user = get_user(q.from_user.id)
-
-    if not p or p["stock"] < 1:
-        await q.answer("This product is out of stock.", show_alert=True)
-        return
-    if not user or user["balance"] < p["price"]:
-        balance = user["balance"] if user else 0
-        await q.answer(
-            f"Insufficient balance. Your balance: {money(balance)}",
-            show_alert=True,
-        )
-        return
-
-    # Reserve one unit and debit the wallet atomically.
+    # Reserve a unique phone number and debit the wallet in one transaction.
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        current = conn.execute(
+        product = conn.execute(
             "SELECT * FROM products WHERE id=? AND active=1", (product_id,)
         ).fetchone()
         wallet = conn.execute(
             "SELECT balance FROM users WHERE user_id=?", (q.from_user.id,)
         ).fetchone()
-
-        if not current or current["stock"] < 1:
-            conn.rollback()
-            await q.answer("This product is now out of stock.", show_alert=True)
-            return
-        if not wallet or wallet["balance"] < current["price"]:
-            conn.rollback()
-            await q.answer("Insufficient wallet balance.", show_alert=True)
-            return
-
-        conn.execute(
-            "UPDATE users SET balance=balance-? WHERE user_id=?",
-            (current["price"], q.from_user.id),
-        )
-        conn.execute(
-            "UPDATE products SET stock=stock-1 WHERE id=?",
+        inventory = conn.execute(
+            "SELECT id, phone_number FROM inventory_numbers "
+            "WHERE product_id=? AND status='available' ORDER BY id LIMIT 1",
             (product_id,),
-        )
+        ).fetchone()
+
+        if not product or not inventory:
+            conn.rollback()
+            await q.answer("This product is out of stock.", show_alert=True)
+            return
+        if not wallet or wallet["balance"] < product["price"]:
+            conn.rollback()
+            balance = wallet["balance"] if wallet else 0
+            await q.answer(
+                f"Insufficient balance. Your balance: {money(balance)}",
+                show_alert=True,
+            )
+            return
+
         cur = conn.execute("""
             INSERT INTO orders(user_id, product_id, product_name, quantity, total,
                                status, created_at, updated_at)
             VALUES(?, ?, ?, 1, ?, 'pending', ?, ?)
         """, (
-            q.from_user.id, product_id, current["name"],
-            current["price"], now(), now()
+            q.from_user.id, product_id, product["name"],
+            product["price"], now(), now()
         ))
         order_id = cur.lastrowid
+
+        reserved = conn.execute("""
+            UPDATE inventory_numbers
+            SET status='reserved', order_id=?
+            WHERE id=? AND status='available'
+        """, (order_id, inventory["id"]))
+        if reserved.rowcount != 1:
+            conn.rollback()
+            await q.answer(
+                "Inventory changed. Please try again.", show_alert=True
+            )
+            return
+
+        conn.execute(
+            "UPDATE users SET balance=balance-? WHERE user_id=?",
+            (product["price"], q.from_user.id),
+        )
+        conn.execute(
+            "UPDATE products SET stock=CASE WHEN stock>0 THEN stock-1 ELSE 0 END "
+            "WHERE id=?",
+            (product_id,),
+        )
         conn.execute("""
             INSERT INTO wallet_transactions(user_id, amount, kind, note, created_at)
             VALUES(?, ?, 'purchase', ?, ?)
-        """, (q.from_user.id, -current["price"], f"Order #{order_id}", now()))
+        """, (q.from_user.id, -product["price"], f"Order #{order_id}", now()))
 
     await q.answer("Order placed successfully.")
     await q.edit_message_text(
         f"<b>Order placed successfully</b>\n\n"
         f"Order ID: <code>#{order_id}</code>\n"
-        f"Product: {current['name']}\n"
-        f"Amount: {money(current['price'])}\n"
+        f"Product: {product['name']}\n"
+        f"Amount: {money(product['price'])}\n"
         "Status: <b>Pending admin fulfilment</b>\n\n"
         "Your order has been recorded. The administrator will update its status.",
         parse_mode=ParseMode.HTML,
@@ -317,8 +411,11 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ADMIN_ID,
             f"New order #{order_id}\n"
             f"User: {q.from_user.id} (@{q.from_user.username or 'no username'})\n"
-            f"Product: {current['name']}\nAmount: {money(current['price'])}\n"
-            f"Use /orders to review.",
+            f"Product: {product['name']}\n"
+            f"Assigned phone number: {inventory['phone_number']}\n"
+            f"Amount: {money(product['price'])}\n"
+            f"Manually complete the order, then use /fulfill {order_id}. "
+            f"Use /cancelorder {order_id} to cancel and return the number to inventory.",
         )
     except Exception:
         log.exception("Could not notify admin about order %s", order_id)
@@ -326,10 +423,13 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     await q.answer()
     user = get_user(q.from_user.id)
     await q.edit_message_text(
-        f"<b>My Wallet</b>\nAvailable balance: <b>{money(user['balance'] if user else 0)}</b>",
+        f"<b>My Wallet</b>\nAvailable balance: "
+        f"<b>{money(user['balance'] if user else 0)}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=back_menu(),
     )
@@ -349,6 +449,8 @@ def make_qr(data):
 
 async def topup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     await q.answer()
     context.user_data.pop("payment_request", None)
     keyboard = InlineKeyboardMarkup([
@@ -357,25 +459,43 @@ async def topup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Main Menu", callback_data="home")]
     ])
     await q.edit_message_text(
-        "<b>Add Funds to Your Wallet</b>\n\nChoose a payment method. Submit your paid amount and UTR / transaction hash. Wallet credit is subject to admin verification.",
+        "<b>Add Funds to Your Wallet</b>\n\n"
+        "Choose a payment method. Submit your paid amount and UTR / transaction hash. "
+        "Wallet credit is subject to admin verification.",
         parse_mode=ParseMode.HTML, reply_markup=keyboard
     )
 
 
 async def payment_method_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     await q.answer()
     currency = q.data.split(":", 1)[1]
     context.user_data["payment_request"] = {"currency": currency, "step": "amount"}
     if currency == "INR":
         data = UPI_QR_DATA
-        caption = f"<b>UPI · INR</b>\nUPI ID: <code>{UPI_ID}</code>\nScan to pay, then enter the amount paid."
+        caption = (
+            f"<b>UPI · INR</b>\nUPI ID: <code>{UPI_ID}</code>\n"
+            "Scan to pay, then enter the amount paid."
+        )
     else:
         data = USDT_BEP20_ADDRESS
-        caption = f"<b>USDT · BNB Smart Chain (BEP20)</b>\n<code>{USDT_BEP20_ADDRESS}</code>\nSend USDT on BNB Smart Chain only, then enter the amount paid."
-    await q.message.reply_photo(make_qr(data), caption=caption, parse_mode=ParseMode.HTML)
-    await q.message.reply_text("Enter the amount you paid (numbers only, e.g. 500 or 10.5).")
-    await q.edit_message_text("Payment instructions sent. Complete payment and reply with the amount.", reply_markup=back_menu())
+        caption = (
+            "<b>USDT · BNB Smart Chain (BEP20)</b>\n"
+            f"<code>{USDT_BEP20_ADDRESS}</code>\n"
+            "Send USDT on BNB Smart Chain only, then enter the amount paid."
+        )
+    await q.message.reply_photo(
+        make_qr(data), caption=caption, parse_mode=ParseMode.HTML
+    )
+    await q.message.reply_text(
+        "Enter the amount you paid (numbers only, e.g. 500 or 10.5)."
+    )
+    await q.edit_message_text(
+        "Payment instructions sent. Complete payment and reply with the amount.",
+        reply_markup=back_menu()
+    )
 
 
 async def payment_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -389,27 +509,54 @@ async def payment_message_handler(update: Update, context: ContextTypes.DEFAULT_
             if amount <= 0 or amount > 100000000:
                 raise ValueError
         except ValueError:
-            await update.effective_message.reply_text("Enter a valid positive amount.")
+            await update.effective_message.reply_text(
+                "Enter a valid positive amount."
+            )
             return
         state["amount"] = amount
         state["step"] = "reference"
-        await update.effective_message.reply_text("Now send your UTR / transaction reference or blockchain transaction hash.")
+        await update.effective_message.reply_text(
+            "Now send your UTR / transaction reference or blockchain transaction hash."
+        )
         return
     if len(raw) < 4 or len(raw) > 180:
-        await update.effective_message.reply_text("Please send a valid transaction reference.")
+        await update.effective_message.reply_text(
+            "Please send a valid transaction reference."
+        )
         return
+
     currency, amount = state["currency"], state["amount"]
     with connect() as conn:
-        cur = conn.execute("INSERT INTO payment_requests(user_id,currency,paid_amount,reference,created_at) VALUES(?,?,?,?,?)", (update.effective_user.id, currency, amount, raw, now()))
+        cur = conn.execute(
+            "INSERT INTO payment_requests(user_id,currency,paid_amount,reference,created_at) "
+            "VALUES(?,?,?,?,?)",
+            (update.effective_user.id, currency, amount, raw, now())
+        )
         payment_id = cur.lastrowid
     context.user_data.pop("payment_request", None)
     await update.effective_message.reply_text(
-        f"<b>Payment submitted</b>\nRequest: <code>#{payment_id}</code>\nPaid: {amount:g} {currency}\nStatus: Pending verification.",
+        f"<b>Payment submitted</b>\nRequest: <code>#{payment_id}</code>\n"
+        f"Paid: {amount:g} {currency}\nStatus: Pending verification.",
         parse_mode=ParseMode.HTML, reply_markup=back_menu()
     )
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Approve INR payment", callback_data=f"payapprove:{payment_id}"), InlineKeyboardButton("Reject", callback_data=f"payreject:{payment_id}")]])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Approve INR payment", callback_data=f"payapprove:{payment_id}"
+        ),
+        InlineKeyboardButton("Reject", callback_data=f"payreject:{payment_id}")
+    ]])
     try:
-        await context.bot.send_message(ADMIN_ID, f"PAYMENT REQUEST #{payment_id}\nUser: {update.effective_user.id}\nMethod: {currency}\nPaid: {amount:g} {currency}\nReference: {raw}\n" + ("Verify BEP20 transaction, then use /creditpayment ID INR_AMOUNT." if currency == "USDT" else "Verify UPI UTR before approval."), reply_markup=keyboard)
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"PAYMENT REQUEST #{payment_id}\nUser: {update.effective_user.id}\n"
+            f"Method: {currency}\nPaid: {amount:g} {currency}\nReference: {raw}\n"
+            + (
+                "Verify BEP20 transaction, then use /creditpayment ID INR_AMOUNT."
+                if currency == "USDT"
+                else "Verify UPI UTR before approval."
+            ),
+            reply_markup=keyboard
+        )
     except Exception:
         log.exception("Could not notify admin about payment request %s", payment_id)
 
@@ -421,25 +568,47 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
     payment_id = int(raw_id)
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        payment = conn.execute("SELECT * FROM payment_requests WHERE id=?", (payment_id,)).fetchone()
+        payment = conn.execute(
+            "SELECT * FROM payment_requests WHERE id=?", (payment_id,)
+        ).fetchone()
         if not payment or payment["status"] != "pending":
             conn.rollback()
             await q.answer("Already reviewed or not found.", show_alert=True)
             return
         if action == "payapprove" and payment["currency"] == "USDT":
             conn.rollback()
-            await q.answer("Verify transfer, then use /creditpayment ID INR_AMOUNT.", show_alert=True)
+            await q.answer(
+                "Verify transfer, then use /creditpayment ID INR_AMOUNT.",
+                show_alert=True
+            )
             return
         credit = payment["paid_amount"] if action == "payapprove" else None
         status = "approved" if credit is not None else "rejected"
         if credit is not None:
-            conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (credit, payment["user_id"]))
-            conn.execute("INSERT INTO wallet_transactions(user_id,amount,kind,note,created_at) VALUES(?,?,'payment_credit',?,?)", (payment["user_id"], credit, f"Verified UPI payment #{payment_id}", now()))
-        conn.execute("UPDATE payment_requests SET status=?,credited_inr=?,reviewed_at=? WHERE id=?", (status, credit, now(), payment_id))
+            conn.execute(
+                "UPDATE users SET balance=balance+? WHERE user_id=?",
+                (credit, payment["user_id"])
+            )
+            conn.execute(
+                "INSERT INTO wallet_transactions(user_id,amount,kind,note,created_at) "
+                "VALUES(?,?,'payment_credit',?,?)",
+                (payment["user_id"], credit,
+                 f"Verified UPI payment #{payment_id}", now())
+            )
+        conn.execute(
+            "UPDATE payment_requests SET status=?,credited_inr=?,reviewed_at=? WHERE id=?",
+            (status, credit, now(), payment_id)
+        )
     await q.answer(status.title())
-    await q.edit_message_text(f"Payment request #{payment_id}: {status.upper()}.")
+    await q.edit_message_text(
+        f"Payment request #{payment_id}: {status.upper()}."
+    )
     try:
-        msg = f"Payment #{payment_id} approved. {money(credit)} added to your wallet." if credit is not None else f"Payment #{payment_id} rejected. Contact support if needed."
+        msg = (
+            f"Payment #{payment_id} approved. {money(credit)} added to your wallet."
+            if credit is not None
+            else f"Payment #{payment_id} rejected. Contact support if needed."
+        )
         await context.bot.send_message(payment["user_id"], msg)
     except Exception:
         log.exception("Could not notify user about payment review")
@@ -448,31 +617,60 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
 @admin_only
 async def credit_usdt_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
-        await update.effective_message.reply_text("Usage: /creditpayment PAYMENT_ID INR_AMOUNT")
+        await update.effective_message.reply_text(
+            "Usage: /creditpayment PAYMENT_ID INR_AMOUNT"
+        )
         return
     try:
         payment_id, credit = int(context.args[0]), float(context.args[1])
         if credit <= 0:
             raise ValueError
     except ValueError:
-        await update.effective_message.reply_text("Enter a valid payment ID and INR credit amount.")
+        await update.effective_message.reply_text(
+            "Enter a valid payment ID and INR credit amount."
+        )
         return
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        payment = conn.execute("SELECT * FROM payment_requests WHERE id=? AND currency='USDT' AND status='pending'", (payment_id,)).fetchone()
+        payment = conn.execute(
+            "SELECT * FROM payment_requests "
+            "WHERE id=? AND currency='USDT' AND status='pending'",
+            (payment_id,)
+        ).fetchone()
         if not payment:
             conn.rollback()
-            await update.effective_message.reply_text("Pending USDT request not found.")
+            await update.effective_message.reply_text(
+                "Pending USDT request not found."
+            )
             return
-        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (credit, payment["user_id"]))
-        conn.execute("INSERT INTO wallet_transactions(user_id,amount,kind,note,created_at) VALUES(?,?,'payment_credit',?,?)", (payment["user_id"], credit, f"Verified USDT payment #{payment_id}", now()))
-        conn.execute("UPDATE payment_requests SET status='approved',credited_inr=?,reviewed_at=? WHERE id=?", (credit, now(), payment_id))
-    await update.effective_message.reply_text(f"USDT request #{payment_id} verified. {money(credit)} credited.")
-    await context.bot.send_message(payment["user_id"], f"USDT payment #{payment_id} approved. {money(credit)} added to your wallet.")
+        conn.execute(
+            "UPDATE users SET balance=balance+? WHERE user_id=?",
+            (credit, payment["user_id"])
+        )
+        conn.execute(
+            "INSERT INTO wallet_transactions(user_id,amount,kind,note,created_at) "
+            "VALUES(?,?,'payment_credit',?,?)",
+            (payment["user_id"], credit,
+             f"Verified USDT payment #{payment_id}", now())
+        )
+        conn.execute(
+            "UPDATE payment_requests SET status='approved',credited_inr=?,reviewed_at=? "
+            "WHERE id=?",
+            (credit, now(), payment_id)
+        )
+    await update.effective_message.reply_text(
+        f"USDT request #{payment_id} verified. {money(credit)} credited."
+    )
+    await context.bot.send_message(
+        payment["user_id"],
+        f"USDT payment #{payment_id} approved. {money(credit)} added to your wallet."
+    )
 
 
 async def orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     await q.answer()
     with connect() as conn:
         rows = conn.execute(
@@ -483,21 +681,28 @@ async def orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "You have no orders yet."
     else:
         lines = ["<b>Your Recent Orders</b>"]
-        for o in rows:
+        for order in rows:
             lines.append(
-                f"#{o['id']} · {o['product_name']} · {money(o['total'])} · "
-                f"<b>{o['status'].title()}</b>"
+                f"#{order['id']} · {order['product_name']} · "
+                f"{money(order['total'])} · <b>{order['status'].title()}</b>"
             )
         text = "\n".join(lines)
-    await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=back_menu())
+    await q.edit_message_text(
+        text, parse_mode=ParseMode.HTML, reply_markup=back_menu()
+    )
 
 
 async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if await block_for_maintenance(q):
+        return
     await q.answer()
     await q.edit_message_text(
         "For order or wallet support, contact GTS Network Support.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Contact Support", url=SUPPORT_URL)], [InlineKeyboardButton("Main Menu", callback_data="home")]]),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Contact Support", url=SUPPORT_URL)],
+            [InlineKeyboardButton("Main Menu", callback_data="home")]
+        ]),
     )
 
 
@@ -505,19 +710,31 @@ async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with connect() as conn:
         users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        products = conn.execute("SELECT COUNT(*) FROM products WHERE active=1").fetchone()[0]
-        stock = conn.execute("SELECT COALESCE(SUM(stock),0) FROM products WHERE active=1").fetchone()[0]
-        pending = conn.execute("SELECT COUNT(*) FROM orders WHERE status='pending'").fetchone()[0]
+        products = conn.execute(
+            "SELECT COUNT(*) FROM products WHERE active=1"
+        ).fetchone()[0]
+        stock = conn.execute(
+            "SELECT COUNT(*) FROM inventory_numbers WHERE status='available'"
+        ).fetchone()[0]
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE status='pending'"
+        ).fetchone()[0]
         sales = conn.execute(
             "SELECT COALESCE(SUM(total),0) FROM orders WHERE status='fulfilled'"
         ).fetchone()[0]
     text = (
         "<b>CaseAltBot · Admin Dashboard</b>\n\n"
         f"Users: {users}\nActive products: {products}\n"
-        f"Listed stock units: {stock}\nPending orders: {pending}\n"
-        f"Fulfilled order value: {money(sales)}\n\n"
+        f"Available phone numbers: {stock}\nPending orders: {pending}\n"
+        f"Fulfilled order value: {money(sales)}\n"
+        f"Maintenance: {'ON' if maintenance_enabled() else 'OFF'}\n\n"
         "<b>Admin commands</b>\n"
         "/addproduct CATEGORY|NAME|DESCRIPTION|PRICE|STOCK\n"
+        "/addnumber PRODUCT_ID\n"
+        "/numbers PRODUCT_ID\n"
+        "/cancel (cancel number upload)\n"
+        "/maintenance on\n"
+        "/maintenance off\n"
         "/editstock PRODUCT_ID DELTA\n"
         "/setprice PRODUCT_ID PRICE\n"
         "/hide PRODUCT_ID\n"
@@ -526,7 +743,8 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/deductfunds USER_ID AMOUNT\n"
         "/orders\n"
         "/fulfill ORDER_ID\n"
-        "/cancelorder ORDER_ID"
+        "/cancelorder ORDER_ID\n"
+        "/creditpayment PAYMENT_ID INR_AMOUNT"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -537,7 +755,8 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = [x.strip() for x in raw.split("|")]
     if len(parts) != 5:
         await update.effective_message.reply_text(
-            "Usage:\n/addproduct CATEGORY|NAME|DESCRIPTION|PRICE|STOCK"
+            "Usage:\n/addproduct CATEGORY|NAME|DESCRIPTION|PRICE|STOCK\n"
+            "For number inventory, start STOCK at 0 and add numbers with /addnumber."
         )
         return
     category, name, description, price_text, stock_text = parts
@@ -547,7 +766,9 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if price < 0 or stock < 0:
             raise ValueError
     except ValueError:
-        await update.effective_message.reply_text("Price and stock must be valid non-negative numbers.")
+        await update.effective_message.reply_text(
+            "Price and stock must be valid non-negative numbers."
+        )
         return
     with connect() as conn:
         cur = conn.execute("""
@@ -556,68 +777,237 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (category, name, description, price, stock, now()))
         product_id = cur.lastrowid
     await update.effective_message.reply_text(
-        f"Product added. ID: {product_id}\nName: {name}\nPrice: {money(price)}\nStock: {stock}"
+        f"Product added. ID: {product_id}\nName: {name}\n"
+        f"Price: {money(price)}\nListed stock: {stock}\n"
+        "Note: Customers can only order after individual numbers are added."
+    )
+
+
+@admin_only
+async def add_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Usage: /addnumber PRODUCT_ID")
+        return
+    try:
+        product_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("Product ID must be a number.")
+        return
+    with connect() as conn:
+        product = conn.execute(
+            "SELECT id, name FROM products WHERE id=?", (product_id,)
+        ).fetchone()
+    if not product:
+        await update.effective_message.reply_text("Product not found.")
+        return
+    context.user_data["inventory_upload_product_id"] = product_id
+    await update.effective_message.reply_text(
+        f"Send one phone number for product #{product_id} ({product['name']}).\n"
+        "Include country code, for example +919876543210.\n"
+        "Send the phone number only. Use /cancel to stop."
+    )
+
+
+@admin_only
+async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("inventory_upload_product_id", None)
+    await update.effective_message.reply_text("Current number upload cancelled.")
+
+
+@admin_only
+async def list_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Usage: /numbers PRODUCT_ID")
+        return
+    try:
+        product_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("Product ID must be a number.")
+        return
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, phone_number, status, order_id FROM inventory_numbers "
+            "WHERE product_id=? ORDER BY id DESC LIMIT 100",
+            (product_id,)
+        ).fetchall()
+    if not rows:
+        await update.effective_message.reply_text(
+            "No phone numbers found for this product."
+        )
+        return
+    labels = {
+        "available": "Available",
+        "reserved": "Reserved",
+        "sold": "Sold",
+    }
+    lines = [f"Inventory for product #{product_id}:"]
+    for row in rows:
+        order_label = f"#{row['order_id']}" if row["order_id"] else "—"
+        lines.append(
+            f"Inventory ID: {row['id']} | Phone: {row['phone_number']} | "
+            f"Status: {labels[row['status']]} | Order: {order_label}"
+        )
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+@admin_only
+async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) != 1 or context.args[0].lower() not in ("on", "off"):
+        await update.effective_message.reply_text(
+            "Usage: /maintenance on OR /maintenance off"
+        )
+        return
+    value = context.args[0].lower()
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO bot_settings(key,value) VALUES('maintenance',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (value,)
+        )
+    await update.effective_message.reply_text(
+        "Maintenance mode enabled. Customer access is paused."
+        if value == "on"
+        else "Maintenance mode disabled. Customer access is restored."
+    )
+
+
+async def inventory_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    product_id = context.user_data.get("inventory_upload_product_id")
+    if product_id is None or update.effective_user.id != ADMIN_ID:
+        return
+    raw = (update.effective_message.text or "").strip()
+    if not re.fullmatch(r"\+?[1-9]\d{6,14}", raw):
+        await update.effective_message.reply_text(
+            "Invalid phone number. Send one phone number with country code only, "
+            "for example +919876543210."
+        )
+        return
+    phone = raw if raw.startswith("+") else f"+{raw}"
+    try:
+        with connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            exists = conn.execute(
+                "SELECT id FROM products WHERE id=?", (product_id,)
+            ).fetchone()
+            if not exists:
+                conn.rollback()
+                context.user_data.pop("inventory_upload_product_id", None)
+                await update.effective_message.reply_text(
+                    "Product no longer exists. Upload cancelled."
+                )
+                return
+            conn.execute(
+                "INSERT INTO inventory_numbers(product_id,phone_number,status,created_at) "
+                "VALUES(?,?,'available',?)",
+                (product_id, phone, now())
+            )
+            conn.execute(
+                "UPDATE products SET stock=stock+1 WHERE id=?", (product_id,)
+            )
+    except sqlite3.IntegrityError:
+        await update.effective_message.reply_text(
+            "This phone number is already in inventory. Send another number or /cancel."
+        )
+        return
+
+    context.user_data.pop("inventory_upload_product_id", None)
+    await update.effective_message.reply_text(
+        f"Number added successfully.\nProduct ID: {product_id}\n"
+        f"Phone: {phone}\nStatus: Available"
     )
 
 
 @admin_only
 async def edit_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
-        await update.effective_message.reply_text("Usage: /editstock PRODUCT_ID DELTA")
+        await update.effective_message.reply_text(
+            "Usage: /editstock PRODUCT_ID DELTA\n"
+            "This changes the legacy displayed stock only; orders still require "
+            "an available number in inventory."
+        )
         return
     try:
         product_id, delta = int(context.args[0]), int(context.args[1])
     except ValueError:
-        await update.effective_message.reply_text("Product ID and delta must be integers.")
+        await update.effective_message.reply_text(
+            "Product ID and delta must be integers."
+        )
         return
     with connect() as conn:
-        p = conn.execute("SELECT stock FROM products WHERE id=?", (product_id,)).fetchone()
-        if not p or p["stock"] + delta < 0:
-            await update.effective_message.reply_text("Product not found or stock cannot become negative.")
+        product = conn.execute(
+            "SELECT stock FROM products WHERE id=?", (product_id,)
+        ).fetchone()
+        if not product or product["stock"] + delta < 0:
+            await update.effective_message.reply_text(
+                "Product not found or stock cannot become negative."
+            )
             return
-        conn.execute("UPDATE products SET stock=stock+? WHERE id=?", (delta, product_id))
-        new_stock = p["stock"] + delta
-    await update.effective_message.reply_text(f"Stock updated. New stock: {new_stock}")
+        conn.execute(
+            "UPDATE products SET stock=stock+? WHERE id=?",
+            (delta, product_id)
+        )
+        new_stock = product["stock"] + delta
+    await update.effective_message.reply_text(
+        f"Listed stock updated. New value: {new_stock}"
+    )
 
 
 @admin_only
 async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
-        await update.effective_message.reply_text("Usage: /setprice PRODUCT_ID PRICE")
+        await update.effective_message.reply_text(
+            "Usage: /setprice PRODUCT_ID PRICE"
+        )
         return
     try:
         product_id, price = int(context.args[0]), float(context.args[1])
         if price < 0:
             raise ValueError
     except ValueError:
-        await update.effective_message.reply_text("Enter a valid product ID and non-negative price.")
+        await update.effective_message.reply_text(
+            "Enter a valid product ID and non-negative price."
+        )
         return
     with connect() as conn:
-        cur = conn.execute("UPDATE products SET price=? WHERE id=?", (price, product_id))
-    await update.effective_message.reply_text("Price updated." if cur.rowcount else "Product not found.")
+        cur = conn.execute(
+            "UPDATE products SET price=? WHERE id=?", (price, product_id)
+        )
+    await update.effective_message.reply_text(
+        "Price updated." if cur.rowcount else "Product not found."
+    )
 
 
 @admin_only
 async def toggle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
-        await update.effective_message.reply_text("Usage: /hide PRODUCT_ID or /show PRODUCT_ID")
+        await update.effective_message.reply_text(
+            "Usage: /hide PRODUCT_ID or /show PRODUCT_ID"
+        )
         return
     try:
         product_id = int(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("Product ID must be an integer.")
+        await update.effective_message.reply_text(
+            "Product ID must be an integer."
+        )
         return
-    active = 0 if update.effective_message.text.startswith("/hide") else 1
+    active = 0 if update.effective_message.text.split()[0].split("@")[0] == "/hide" else 1
     with connect() as conn:
-        cur = conn.execute("UPDATE products SET active=? WHERE id=?", (active, product_id))
-    await update.effective_message.reply_text("Product updated." if cur.rowcount else "Product not found.")
+        cur = conn.execute(
+            "UPDATE products SET active=? WHERE id=?", (active, product_id)
+        )
+    await update.effective_message.reply_text(
+        "Product updated." if cur.rowcount else "Product not found."
+    )
 
 
 @admin_only
 async def wallet_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
     command = update.effective_message.text.split()[0].split("@")[0]
     if len(context.args) != 2:
-        await update.effective_message.reply_text(f"Usage: {command} USER_ID AMOUNT")
+        await update.effective_message.reply_text(
+            f"Usage: {command} USER_ID AMOUNT"
+        )
         return
     try:
         user_id = int(context.args[0])
@@ -625,26 +1015,40 @@ async def wallet_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if amount <= 0:
             raise ValueError
     except ValueError:
-        await update.effective_message.reply_text("Enter a valid user ID and positive amount.")
+        await update.effective_message.reply_text(
+            "Enter a valid user ID and positive amount."
+        )
         return
     sign = -1 if command == "/deductfunds" else 1
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        user = conn.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+        user = conn.execute(
+            "SELECT balance FROM users WHERE user_id=?", (user_id,)
+        ).fetchone()
         if not user:
             conn.rollback()
-            await update.effective_message.reply_text("User not found. They must start the bot first.")
+            await update.effective_message.reply_text(
+                "User not found. They must start the bot first."
+            )
             return
         if sign < 0 and user["balance"] < amount:
             conn.rollback()
-            await update.effective_message.reply_text("User does not have enough balance.")
+            await update.effective_message.reply_text(
+                "User does not have enough balance."
+            )
             return
-        conn.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (sign * amount, user_id))
+        conn.execute(
+            "UPDATE users SET balance=balance+? WHERE user_id=?",
+            (sign * amount, user_id)
+        )
         conn.execute("""
             INSERT INTO wallet_transactions(user_id, amount, kind, note, created_at)
             VALUES(?, ?, ?, ?, ?)
-        """, (user_id, sign * amount, "admin_credit" if sign > 0 else "admin_debit",
-              "Admin wallet adjustment", now()))
+        """, (
+            user_id, sign * amount,
+            "admin_credit" if sign > 0 else "admin_debit",
+            "Admin wallet adjustment", now()
+        ))
     await update.effective_message.reply_text(
         f"Wallet updated for {user_id}. Adjustment: {money(sign * amount)}"
     )
@@ -662,10 +1066,10 @@ async def list_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("No orders found.")
         return
     lines = ["Recent orders:"]
-    for o in rows:
+    for order in rows:
         lines.append(
-            f"#{o['id']} | {o['product_name']} | {money(o['total'])} | "
-            f"{o['status']} | user {o['user_id']}"
+            f"#{order['id']} | {order['product_name']} | "
+            f"{money(order['total'])} | {order['status']} | user {order['user_id']}"
         )
     await update.effective_message.reply_text("\n".join(lines))
 
@@ -682,14 +1086,23 @@ async def fulfill_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        order = conn.execute(
+            "SELECT * FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
         if not order or order["status"] != "pending":
             conn.rollback()
-            await update.effective_message.reply_text("Pending order not found.")
+            await update.effective_message.reply_text(
+                "Pending order not found."
+            )
             return
         conn.execute(
             "UPDATE orders SET status='fulfilled', updated_at=? WHERE id=?",
-            (now(), order_id),
+            (now(), order_id)
+        )
+        conn.execute(
+            "UPDATE inventory_numbers SET status='sold' "
+            "WHERE order_id=? AND status='reserved'",
+            (order_id,)
         )
     try:
         await context.bot.send_message(
@@ -698,14 +1111,20 @@ async def fulfill_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "If you need help, contact support."
         )
     except Exception:
-        log.exception("Could not notify user for fulfilled order %s", order_id)
-    await update.effective_message.reply_text(f"Order #{order_id} marked fulfilled.")
+        log.exception(
+            "Could not notify user for fulfilled order %s", order_id
+        )
+    await update.effective_message.reply_text(
+        f"Order #{order_id} marked fulfilled. Reserved number marked Sold."
+    )
 
 
 @admin_only
 async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
-        await update.effective_message.reply_text("Usage: /cancelorder ORDER_ID")
+        await update.effective_message.reply_text(
+            "Usage: /cancelorder ORDER_ID"
+        )
         return
     try:
         order_id = int(context.args[0])
@@ -714,52 +1133,69 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+        order = conn.execute(
+            "SELECT * FROM orders WHERE id=?", (order_id,)
+        ).fetchone()
         if not order or order["status"] != "pending":
             conn.rollback()
-            await update.effective_message.reply_text("Pending order not found.")
+            await update.effective_message.reply_text(
+                "Pending order not found."
+            )
             return
         conn.execute(
             "UPDATE orders SET status='cancelled', updated_at=? WHERE id=?",
-            (now(), order_id),
+            (now(), order_id)
         )
         conn.execute(
             "UPDATE users SET balance=balance+? WHERE user_id=?",
-            (order["total"], order["user_id"]),
+            (order["total"], order["user_id"])
         )
         conn.execute(
             "UPDATE products SET stock=stock+? WHERE id=?",
-            (order["quantity"], order["product_id"]),
+            (order["quantity"], order["product_id"])
+        )
+        conn.execute(
+            "UPDATE inventory_numbers SET status='available', order_id=NULL "
+            "WHERE order_id=? AND status='reserved'",
+            (order_id,)
         )
         conn.execute("""
             INSERT INTO wallet_transactions(user_id, amount, kind, note, created_at)
             VALUES(?, ?, 'refund', ?, ?)
-        """, (order["user_id"], order["total"], f"Refund for order #{order_id}", now()))
+        """, (
+            order["user_id"], order["total"],
+            f"Refund for order #{order_id}", now()
+        ))
     await update.effective_message.reply_text(
-        f"Order #{order_id} cancelled. Wallet refunded and stock restored."
+        f"Order #{order_id} cancelled. Wallet refunded and number returned to inventory."
     )
     try:
         await context.bot.send_message(
             order["user_id"],
-            f"Your order #{order_id} was cancelled. {money(order['total'])} has been refunded."
+            f"Your order #{order_id} was cancelled. "
+            f"{money(order['total'])} has been refunded."
         )
     except Exception:
-        log.exception("Could not notify user for cancelled order %s", order_id)
-
-
-async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("Unknown command. Use /start to open the shop.")
+        log.exception(
+            "Could not notify user for cancelled order %s", order_id
+        )
 
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing. Set it in your hosting provider's environment variables.")
+        raise RuntimeError(
+            "BOT_TOKEN is missing. Set it in your hosting provider's environment variables."
+        )
     init_db()
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin_panel))
     app.add_handler(CommandHandler("addproduct", add_product))
+    app.add_handler(CommandHandler("addnumber", add_number))
+    app.add_handler(CommandHandler("numbers", list_numbers))
+    app.add_handler(CommandHandler("maintenance", maintenance_command))
+    app.add_handler(CommandHandler("cancel", cancel_upload))
     app.add_handler(CommandHandler("editstock", edit_stock))
     app.add_handler(CommandHandler("setprice", set_price))
     app.add_handler(CommandHandler("hide", toggle_product))
@@ -770,9 +1206,30 @@ def main():
     app.add_handler(CommandHandler("fulfill", fulfill_order))
     app.add_handler(CommandHandler("cancelorder", cancel_order))
     app.add_handler(CommandHandler("creditpayment", credit_usdt_payment))
-    app.add_handler(CallbackQueryHandler(payment_method_callback, pattern="^paymethod:"))
-    app.add_handler(CallbackQueryHandler(payment_review_callback, pattern="^payapprove:|^payreject:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, payment_message_handler))
+
+    app.add_handler(
+        CallbackQueryHandler(payment_method_callback, pattern="^paymethod:")
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            payment_review_callback, pattern="^payapprove:|^payreject:"
+        )
+    )
+
+    # Group -1 handles pending admin number uploads before the payment text handler.
+    # Both handlers can run in their respective groups without blocking each other.
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND, inventory_message_handler
+        ),
+        group=-1,
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND, payment_message_handler
+        ),
+        group=0,
+    )
 
     app.add_handler(CallbackQueryHandler(home_callback, pattern="^home$"))
     app.add_handler(CallbackQueryHandler(shop_callback, pattern="^shop$"))
