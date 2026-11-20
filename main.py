@@ -133,13 +133,13 @@ def maintenance_enabled():
 async def block_for_maintenance(query):
     if query.from_user.id != ADMIN_ID and maintenance_enabled():
         await query.answer(
-            "The bot is temporarily under maintenance. Please try again later.",
+            "CaseAltBot is temporarily unavailable while maintenance is in progress. Customer actions are paused; please try again after maintenance has ended.",
             show_alert=True,
         )
         try:
             await query.edit_message_text(
                 f"<b>{BOT_NAME} is under maintenance</b>\n\n"
-                "We are making improvements. Please try again later.\n\n"
+                "Our team is carrying out maintenance to improve the service. Please return once maintenance is complete.\n\n"
                 f"<i>{BRAND}</i>",
                 parse_mode=ParseMode.HTML,
             )
@@ -197,10 +197,10 @@ def admin_only(func):
         if not update.effective_user or update.effective_user.id != ADMIN_ID:
             if update.callback_query:
                 await update.callback_query.answer(
-                    "Admin access only.", show_alert=True
+                    "This command is restricted to the CaseAltBot administrator. If you believe you should have access, contact the system administrator.", show_alert=True
                 )
             elif update.effective_message:
-                await update.effective_message.reply_text("Admin access only.")
+                await update.effective_message.reply_text("This command is restricted to the CaseAltBot administrator. If you believe you should have access, contact the system administrator.")
             return
         return await func(update, context)
     return wrapper
@@ -217,7 +217,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"<b>Welcome to {BOT_NAME}</b>\n"
         f"<i>{BRAND}</i>\n\n"
-        "Browse available products, check your wallet, or review your orders."
+        "Use the menu below to browse currently available products, view your wallet balance, review recent orders, or contact GTS Network Support."
     )
     await update.effective_message.reply_text(
         msg, parse_mode=ParseMode.HTML, reply_markup=main_menu()
@@ -231,7 +231,7 @@ async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     register_user(q.from_user)
     await q.edit_message_text(
-        f"<b>Welcome to {BOT_NAME}</b>\n<i>{BRAND}</i>\n\nChoose an option:",
+        f"<b>Welcome to {BOT_NAME}</b>\n<i>{BRAND}</i>\n\nSelect an option below to continue. You can return to this menu at any time using the Main Menu button.",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu(),
     )
@@ -249,7 +249,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not products:
         await q.edit_message_text(
-            "The shop is being updated. Please check again later.",
+            "There are currently no active products available in the shop. Please check again later, or contact support if you need assistance.",
             reply_markup=back_menu(),
         )
         return
@@ -268,7 +268,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     rows.append([InlineKeyboardButton("Main Menu", callback_data="home")])
     await q.edit_message_text(
-        "<b>Available Products</b>\nSelect a product to view its details:",
+        "<b>Available Products</b>\nThe products listed below are currently active. Select a product to review its price, description, and available quantity before placing an order:",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -282,7 +282,7 @@ async def product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         product_id = int(q.data.split(":", 1)[1])
     except (ValueError, IndexError):
-        await q.answer("Invalid product.", show_alert=True)
+        await q.answer("The selected product could not be identified. Return to the shop and select a valid product.", show_alert=True)
         return
 
     with connect() as conn:
@@ -297,7 +297,7 @@ async def product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not p:
         await q.edit_message_text(
-            "This product is no longer available.", reply_markup=back_menu()
+            "This product is no longer active or available for purchase. Return to the shop to browse the current listings.", reply_markup=back_menu()
         )
         return
 
@@ -306,8 +306,8 @@ async def product_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Category: {p['category']}\n"
         f"Price: {money(p['price'])}\n"
         f"Available quantity: {available}\n\n"
-        f"{p['description'] or 'No additional description.'}\n\n"
-        "Orders are placed from your wallet and are reviewed by the administrator."
+        f"{p['description'] or 'No additional product description has been provided.'}\n\n"
+        "Orders are paid for using your available wallet balance. After an order is placed, it remains pending until the administrator completes or cancels it."
     )
     buttons = []
     if available > 0:
@@ -328,7 +328,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         product_id = int(q.data.split(":", 1)[1])
     except (ValueError, IndexError):
-        await q.answer("Invalid product.", show_alert=True)
+        await q.answer("The selected product could not be identified. Return to the shop and select a valid product.", show_alert=True)
         return
 
     # Reserve a unique phone number and debit the wallet in one transaction.
@@ -348,13 +348,13 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if not product or not inventory:
             conn.rollback()
-            await q.answer("This product is out of stock.", show_alert=True)
+            await q.answer("This product currently has no available inventory. Please return to the shop and choose another product, or check back later.", show_alert=True)
             return
         if not wallet or wallet["balance"] < product["price"]:
             conn.rollback()
             balance = wallet["balance"] if wallet else 0
             await q.answer(
-                f"Insufficient balance. Your balance: {money(balance)}",
+                f"Your wallet balance is not sufficient to place this order. Current available balance: {money(balance)}. Add funds to your wallet or choose a lower-priced product.",
                 show_alert=True,
             )
             return
@@ -377,7 +377,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if reserved.rowcount != 1:
             conn.rollback()
             await q.answer(
-                "Inventory changed. Please try again.", show_alert=True
+                "The selected inventory item is no longer available. No order was completed; please try placing your order again.", show_alert=True
             )
             return
 
@@ -395,14 +395,14 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             VALUES(?, ?, 'purchase', ?, ?)
         """, (q.from_user.id, -product["price"], f"Order #{order_id}", now()))
 
-    await q.answer("Order placed successfully.")
+    await q.answer("Your order has been recorded successfully.")
     await q.edit_message_text(
-        f"<b>Order placed successfully</b>\n\n"
+        f"<b>Order Submitted Successfully</b>\n\n"
         f"Order ID: <code>#{order_id}</code>\n"
         f"Product: {product['name']}\n"
         f"Amount: {money(product['price'])}\n"
         "Status: <b>Pending admin fulfilment</b>\n\n"
-        "Your order has been recorded. The administrator will update its status.",
+        "Your wallet has been charged for this order, and the order is now pending administrator fulfilment. You will receive another message when its status is updated.",
         parse_mode=ParseMode.HTML,
         reply_markup=back_menu(),
     )
@@ -428,7 +428,7 @@ async def balance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     user = get_user(q.from_user.id)
     await q.edit_message_text(
-        f"<b>My Wallet</b>\nAvailable balance: "
+        f"<b>My Wallet</b>\nThis is the amount currently available for purchases. Pending payment requests are not included until they have been verified and credited.\nAvailable balance: "
         f"<b>{money(user['balance'] if user else 0)}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=back_menu(),
@@ -477,23 +477,23 @@ async def payment_method_callback(update: Update, context: ContextTypes.DEFAULT_
         data = UPI_QR_DATA
         caption = (
             f"<b>UPI · INR</b>\nUPI ID: <code>{UPI_ID}</code>\n"
-            "Scan to pay, then enter the amount paid."
+            "Scan the QR code or use the UPI ID shown above to complete your INR payment. After paying, return to this chat and enter the exact amount transferred."
         )
     else:
         data = USDT_BEP20_ADDRESS
         caption = (
             "<b>USDT · BNB Smart Chain (BEP20)</b>\n"
             f"<code>{USDT_BEP20_ADDRESS}</code>\n"
-            "Send USDT on BNB Smart Chain only, then enter the amount paid."
+            "Send USDT to the address above using the BNB Smart Chain (BEP20) network only. Transfers sent through another network may not be recoverable. After paying, return to this chat and enter the exact USDT amount transferred."
         )
     await q.message.reply_photo(
         make_qr(data), caption=caption, parse_mode=ParseMode.HTML
     )
     await q.message.reply_text(
-        "Enter the amount you paid (numbers only, e.g. 500 or 10.5)."
+        "Enter the exact amount you transferred using numbers only (for example, 500 or 10.5). Do not include the currency symbol."
     )
     await q.edit_message_text(
-        "Payment instructions sent. Complete payment and reply with the amount.",
+        "Payment instructions have been sent above. Complete the transfer using the selected method, then reply here with the exact amount paid to continue your verification request.",
         reply_markup=back_menu()
     )
 
@@ -510,18 +510,18 @@ async def payment_message_handler(update: Update, context: ContextTypes.DEFAULT_
                 raise ValueError
         except ValueError:
             await update.effective_message.reply_text(
-                "Enter a valid positive amount."
+                "The amount must be a valid number greater than zero. Enter the exact amount you paid, without a currency symbol, to continue."
             )
             return
         state["amount"] = amount
         state["step"] = "reference"
         await update.effective_message.reply_text(
-            "Now send your UTR / transaction reference or blockchain transaction hash."
+            "Now send the payment reference for the transfer: the UTR from your UPI transaction, or the transaction hash for a USDT transfer. This reference is required for administrator verification."
         )
         return
     if len(raw) < 4 or len(raw) > 180:
         await update.effective_message.reply_text(
-            "Please send a valid transaction reference."
+            "The transaction reference must contain between 4 and 180 characters. Please check the UTR or transaction hash and send it again."
         )
         return
 
@@ -573,12 +573,12 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
         ).fetchone()
         if not payment or payment["status"] != "pending":
             conn.rollback()
-            await q.answer("Already reviewed or not found.", show_alert=True)
+            await q.answer("This payment request has already been reviewed, or the request ID does not exist. No further action was taken.", show_alert=True)
             return
         if action == "payapprove" and payment["currency"] == "USDT":
             conn.rollback()
             await q.answer(
-                "Verify transfer, then use /creditpayment ID INR_AMOUNT.",
+                "USDT payments cannot be approved using this button. First verify the transaction on the BNB Smart Chain, then use /creditpayment PAYMENT_ID INR_AMOUNT to credit the verified INR value.",
                 show_alert=True
             )
             return
@@ -601,13 +601,13 @@ async def payment_review_callback(update: Update, context: ContextTypes.DEFAULT_
         )
     await q.answer(status.title())
     await q.edit_message_text(
-        f"Payment request #{payment_id}: {status.upper()}."
+        f"Payment request #{payment_id} has been marked as {status.upper()}. The customer will be notified of this review result."
     )
     try:
         msg = (
-            f"Payment #{payment_id} approved. {money(credit)} added to your wallet."
+            f"Your payment request #{payment_id} has been approved. {money(credit)} has been credited to your wallet and is now available for purchases."
             if credit is not None
-            else f"Payment #{payment_id} rejected. Contact support if needed."
+            else f"Your payment request #{payment_id} was not approved, so no funds were added to your wallet. If you believe the payment details are correct, contact GTS Network Support and provide the request ID."
         )
         await context.bot.send_message(payment["user_id"], msg)
     except Exception:
@@ -627,7 +627,7 @@ async def credit_usdt_payment(update: Update, context: ContextTypes.DEFAULT_TYPE
             raise ValueError
     except ValueError:
         await update.effective_message.reply_text(
-            "Enter a valid payment ID and INR credit amount."
+            "Enter a valid payment request ID and the verified INR amount to credit. The INR amount must be greater than zero."
         )
         return
     with connect() as conn:
@@ -640,7 +640,7 @@ async def credit_usdt_payment(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not payment:
             conn.rollback()
             await update.effective_message.reply_text(
-                "Pending USDT request not found."
+                "No pending USDT payment request was found for that ID. Check the request ID and confirm that it has not already been reviewed."
             )
             return
         conn.execute(
@@ -659,11 +659,11 @@ async def credit_usdt_payment(update: Update, context: ContextTypes.DEFAULT_TYPE
             (credit, now(), payment_id)
         )
     await update.effective_message.reply_text(
-        f"USDT request #{payment_id} verified. {money(credit)} credited."
+        f"USDT payment request #{payment_id} has been verified. {money(credit)} has been credited to the customer's INR wallet."
     )
     await context.bot.send_message(
         payment["user_id"],
-        f"USDT payment #{payment_id} approved. {money(credit)} added to your wallet."
+        f"Your USDT payment request #{payment_id} has been verified and approved. {money(credit)} has been credited to your INR wallet and is now available for purchases."
     )
 
 
@@ -678,7 +678,7 @@ async def orders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (q.from_user.id,),
         ).fetchall()
     if not rows:
-        text = "You have no orders yet."
+        text = "You have not placed any orders yet. Once you place an order, its ID, product, total amount, and current fulfilment status will appear here."
     else:
         lines = ["<b>Your Recent Orders</b>"]
         for order in rows:
@@ -698,7 +698,7 @@ async def support_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer()
     await q.edit_message_text(
-        "For order or wallet support, contact GTS Network Support.",
+        "For assistance with an order, wallet balance, or payment verification, contact GTS Network Support using the button below. Include the relevant order or payment request ID, and do not share passwords or login credentials.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Contact Support", url=SUPPORT_URL)],
             [InlineKeyboardButton("Main Menu", callback_data="home")]
@@ -811,7 +811,7 @@ async def add_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("inventory_upload_product_id", None)
-    await update.effective_message.reply_text("Current number upload cancelled.")
+    await update.effective_message.reply_text("The current inventory upload session has been cancelled. No additional phone number will be added unless you start a new upload with /addnumber.")
 
 
 @admin_only
@@ -832,7 +832,7 @@ async def list_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
     if not rows:
         await update.effective_message.reply_text(
-            "No phone numbers found for this product."
+            "No inventory numbers are currently recorded for product #{product_id}. Add numbers with /addnumber PRODUCT_ID before accepting customer orders."
         )
         return
     labels = {
@@ -865,9 +865,9 @@ async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             (value,)
         )
     await update.effective_message.reply_text(
-        "Maintenance mode enabled. Customer access is paused."
+        "Maintenance mode is now enabled. Customer-facing commands and actions are paused; administrator commands remain available."
         if value == "on"
-        else "Maintenance mode disabled. Customer access is restored."
+        else "Maintenance mode is now disabled. Customer-facing commands and actions are available again."
     )
 
 
@@ -893,7 +893,7 @@ async def inventory_message_handler(update: Update, context: ContextTypes.DEFAUL
                 conn.rollback()
                 context.user_data.pop("inventory_upload_product_id", None)
                 await update.effective_message.reply_text(
-                    "Product no longer exists. Upload cancelled."
+                    "The selected product no longer exists. This inventory upload session has been cancelled, and no number was added."
                 )
                 return
             conn.execute(
@@ -906,7 +906,7 @@ async def inventory_message_handler(update: Update, context: ContextTypes.DEFAUL
             )
     except sqlite3.IntegrityError:
         await update.effective_message.reply_text(
-            "This phone number is already in inventory. Send another number or /cancel."
+            "This phone number is already recorded in inventory and was not added again. Send a different number to continue, or use /cancel to end the upload session."
         )
         return
 
@@ -948,7 +948,7 @@ async def edit_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         new_stock = product["stock"] + delta
     await update.effective_message.reply_text(
-        f"Listed stock updated. New value: {new_stock}"
+        f"The displayed stock count has been updated successfully. New displayed stock value: {new_stock}. This adjustment does not change the individual phone numbers stored in inventory."
     )
 
 
@@ -973,7 +973,7 @@ async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "UPDATE products SET price=? WHERE id=?", (price, product_id)
         )
     await update.effective_message.reply_text(
-        "Price updated." if cur.rowcount else "Product not found."
+        "The product price has been updated successfully. The new price will be shown in the shop for future orders." if cur.rowcount else "Product not found."
     )
 
 
@@ -997,7 +997,7 @@ async def toggle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "UPDATE products SET active=? WHERE id=?", (active, product_id)
         )
     await update.effective_message.reply_text(
-        "Product updated." if cur.rowcount else "Product not found."
+        "The product listing has been updated successfully." if cur.rowcount else "Product not found."
     )
 
 
@@ -1050,7 +1050,7 @@ async def wallet_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Admin wallet adjustment", now()
         ))
     await update.effective_message.reply_text(
-        f"Wallet updated for {user_id}. Adjustment: {money(sign * amount)}"
+        f"Wallet adjustment completed for user ID {user_id}. Adjustment applied: {money(sign * amount)}. This amount has been recorded in the wallet transaction history."
     )
 
 
@@ -1065,7 +1065,7 @@ async def list_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         await update.effective_message.reply_text("No orders found.")
         return
-    lines = ["Recent orders:"]
+    lines = ["<b>Recent Orders</b>\nThe latest orders are listed below with their product, total value, current status, and customer ID:"]
     for order in rows:
         lines.append(
             f"#{order['id']} | {order['product_name']} | "
@@ -1092,7 +1092,7 @@ async def fulfill_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not order or order["status"] != "pending":
             conn.rollback()
             await update.effective_message.reply_text(
-                "Pending order not found."
+                "No pending order was found for that ID. Check the order ID and confirm that the order has not already been fulfilled or cancelled."
             )
             return
         conn.execute(
@@ -1115,7 +1115,7 @@ async def fulfill_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Could not notify user for fulfilled order %s", order_id
         )
     await update.effective_message.reply_text(
-        f"Order #{order_id} marked fulfilled. Reserved number marked Sold."
+        f"Order #{order_id} has been marked as fulfilled. The phone number reserved for this order has been moved to Sold inventory."
     )
 
 
@@ -1139,7 +1139,7 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not order or order["status"] != "pending":
             conn.rollback()
             await update.effective_message.reply_text(
-                "Pending order not found."
+                "No pending order was found for that ID. Check the order ID and confirm that the order has not already been fulfilled or cancelled."
             )
             return
         conn.execute(
@@ -1167,7 +1167,7 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Refund for order #{order_id}", now()
         ))
     await update.effective_message.reply_text(
-        f"Order #{order_id} cancelled. Wallet refunded and number returned to inventory."
+        f"Order #{order_id} has been cancelled successfully. The full order amount has been returned to the customer's wallet, and the reserved phone number has been restored to available inventory."
     )
     try:
         await context.bot.send_message(
