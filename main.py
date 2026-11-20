@@ -209,8 +209,8 @@ def admin_only(func):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID and maintenance_enabled():
         await update.effective_message.reply_text(
-            f"{BOT_NAME} is temporarily under maintenance. "
-            f"Please try again later.\n\n{BRAND}"
+            f"{BOT_NAME} is temporarily unavailable while maintenance is in progress. "
+            f"Customer access is paused; please return after maintenance is complete.\n\n{BRAND}"
         )
         return
     register_user(update.effective_user)
@@ -409,13 +409,13 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             ADMIN_ID,
-            f"New order #{order_id}\n"
-            f"User: {q.from_user.id} (@{q.from_user.username or 'no username'})\n"
+            f"<b>New Order Alert · #{order_id}</b>\n"
+            f"Customer ID: {q.from_user.id} (@{q.from_user.username or 'no username'})\n"
             f"Product: {product['name']}\n"
-            f"Assigned phone number: {inventory['phone_number']}\n"
-            f"Amount: {money(product['price'])}\n"
-            f"Manually complete the order, then use /fulfill {order_id}. "
-            f"Use /cancelorder {order_id} to cancel and return the number to inventory.",
+            f"Reserved phone number: {inventory['phone_number']}\n"
+            f"Order amount: {money(product['price'])}\n\n"
+            f"Review and fulfil this order manually, then run /fulfill {order_id} to mark it as completed. "
+            f"If it cannot be fulfilled, run /cancelorder {order_id} to cancel it, refund the customer, and release the reserved number.",
         )
     except Exception:
         log.exception("Could not notify admin about order %s", order_id)
@@ -460,8 +460,8 @@ async def topup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await q.edit_message_text(
         "<b>Add Funds to Your Wallet</b>\n\n"
-        "Choose a payment method. Submit your paid amount and UTR / transaction hash. "
-        "Wallet credit is subject to admin verification.",
+        "Select the payment method you intend to use. After completing the transfer, submit the exact amount paid and its UTR or blockchain transaction hash. "
+        "Funds are added to your wallet only after the administrator verifies the payment.",
         parse_mode=ParseMode.HTML, reply_markup=keyboard
     )
 
@@ -535,8 +535,9 @@ async def payment_message_handler(update: Update, context: ContextTypes.DEFAULT_
         payment_id = cur.lastrowid
     context.user_data.pop("payment_request", None)
     await update.effective_message.reply_text(
-        f"<b>Payment submitted</b>\nRequest: <code>#{payment_id}</code>\n"
-        f"Paid: {amount:g} {currency}\nStatus: Pending verification.",
+        f"<b>Payment Request Submitted</b>\nRequest ID: <code>#{payment_id}</code>\n"
+        f"Amount reported: {amount:g} {currency}\nStatus: <b>Pending verification</b>\n\n"
+        "Your payment details have been sent to the administrator for review. Your wallet will be credited only after the transfer is verified.",
         parse_mode=ParseMode.HTML, reply_markup=back_menu()
     )
     keyboard = InlineKeyboardMarkup([[
@@ -756,7 +757,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(parts) != 5:
         await update.effective_message.reply_text(
             "Usage:\n/addproduct CATEGORY|NAME|DESCRIPTION|PRICE|STOCK\n"
-            "For number inventory, start STOCK at 0 and add numbers with /addnumber."
+            "Separate the five fields with |. For phone-number inventory, set STOCK to 0 and add each number separately with /addnumber PRODUCT_ID."
         )
         return
     category, name, description, price_text, stock_text = parts
@@ -767,7 +768,7 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except ValueError:
         await update.effective_message.reply_text(
-            "Price and stock must be valid non-negative numbers."
+            "Enter a valid price of zero or more and a whole-number stock count of zero or more. Do not include a currency symbol in the price."
         )
         return
     with connect() as conn:
@@ -777,34 +778,34 @@ async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (category, name, description, price, stock, now()))
         product_id = cur.lastrowid
     await update.effective_message.reply_text(
-        f"Product added. ID: {product_id}\nName: {name}\n"
-        f"Price: {money(price)}\nListed stock: {stock}\n"
-        "Note: Customers can only order after individual numbers are added."
+        f"<b>Product created successfully</b>\nProduct ID: {product_id}\nName: {name}\n"
+        f"Price: {money(price)}\nDisplayed stock: {stock}\n\n"
+        "Customers can place orders only after individual phone numbers have been added to this product's inventory."
     )
 
 
 @admin_only
 async def add_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
-        await update.effective_message.reply_text("Usage: /addnumber PRODUCT_ID")
+        await update.effective_message.reply_text("Usage: /addnumber PRODUCT_ID\nProvide the ID of an existing product to begin adding phone numbers to its inventory.")
         return
     try:
         product_id = int(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("Product ID must be a number.")
+        await update.effective_message.reply_text("The product ID must be a whole number. Check the product ID and run the command again.")
         return
     with connect() as conn:
         product = conn.execute(
             "SELECT id, name FROM products WHERE id=?", (product_id,)
         ).fetchone()
     if not product:
-        await update.effective_message.reply_text("Product not found.")
+        await update.effective_message.reply_text("No product was found with that ID. Check the ID using the admin product records, then try again.")
         return
     context.user_data["inventory_upload_product_id"] = product_id
     await update.effective_message.reply_text(
-        f"Send one phone number for product #{product_id} ({product['name']}).\n"
-        "Include country code, for example +919876543210.\n"
-        "Send the phone number only. Use /cancel to stop."
+        f"Send one phone number to add it to product #{product_id} ({product['name']}).\n"
+        "Include the country code (for example, +919876543210) and send the number by itself, with no extra text.\n"
+        "To stop this upload process, use /cancel."
     )
 
 
@@ -817,12 +818,12 @@ async def cancel_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def list_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
-        await update.effective_message.reply_text("Usage: /numbers PRODUCT_ID")
+        await update.effective_message.reply_text("Usage: /numbers PRODUCT_ID\nProvide the ID of an existing product to view its most recently added inventory numbers and their statuses.")
         return
     try:
         product_id = int(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("Product ID must be a number.")
+        await update.effective_message.reply_text("The product ID must be a whole number. Check the product ID and run the command again.")
         return
     with connect() as conn:
         rows = conn.execute(
@@ -832,7 +833,7 @@ async def list_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
     if not rows:
         await update.effective_message.reply_text(
-            "No inventory numbers are currently recorded for product #{product_id}. Add numbers with /addnumber PRODUCT_ID before accepting customer orders."
+            f"No inventory numbers are currently recorded for product #{product_id}. Add numbers with /addnumber {product_id} before accepting customer orders."
         )
         return
     labels = {
@@ -854,7 +855,7 @@ async def list_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1 or context.args[0].lower() not in ("on", "off"):
         await update.effective_message.reply_text(
-            "Usage: /maintenance on OR /maintenance off"
+            "Usage: /maintenance on OR /maintenance off\nUse /maintenance on to pause customer access during maintenance, or /maintenance off to restore customer access."
         )
         return
     value = context.args[0].lower()
@@ -878,8 +879,7 @@ async def inventory_message_handler(update: Update, context: ContextTypes.DEFAUL
     raw = (update.effective_message.text or "").strip()
     if not re.fullmatch(r"\+?[1-9]\d{6,14}", raw):
         await update.effective_message.reply_text(
-            "Invalid phone number. Send one phone number with country code only, "
-            "for example +919876543210."
+            "The phone number format is invalid. Send one number only, including its country code (for example, +919876543210). The number must contain 7 to 15 digits."
         )
         return
     phone = raw if raw.startswith("+") else f"+{raw}"
@@ -912,8 +912,8 @@ async def inventory_message_handler(update: Update, context: ContextTypes.DEFAUL
 
     context.user_data.pop("inventory_upload_product_id", None)
     await update.effective_message.reply_text(
-        f"Number added successfully.\nProduct ID: {product_id}\n"
-        f"Phone: {phone}\nStatus: Available"
+        f"Phone number added to inventory successfully.\nProduct ID: {product_id}\n"
+        f"Phone number: {phone}\nInventory status: Available"
     )
 
 
@@ -921,7 +921,7 @@ async def inventory_message_handler(update: Update, context: ContextTypes.DEFAUL
 async def edit_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
         await update.effective_message.reply_text(
-            "Usage: /editstock PRODUCT_ID DELTA\n"
+            "Usage: /editstock PRODUCT_ID DELTA\nProvide a product ID and a whole-number adjustment.\n"
             "This changes the legacy displayed stock only; orders still require "
             "an available number in inventory."
         )
@@ -930,7 +930,7 @@ async def edit_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         product_id, delta = int(context.args[0]), int(context.args[1])
     except ValueError:
         await update.effective_message.reply_text(
-            "Product ID and delta must be integers."
+            "The product ID and stock adjustment (delta) must both be whole numbers. Use a positive delta to increase the displayed count or a negative delta to decrease it."
         )
         return
     with connect() as conn:
@@ -939,7 +939,7 @@ async def edit_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchone()
         if not product or product["stock"] + delta < 0:
             await update.effective_message.reply_text(
-                "Product not found or stock cannot become negative."
+                "The product ID was not found, or this adjustment would make the displayed stock count negative. Check the product ID and current stock before trying again."
             )
             return
         conn.execute(
@@ -956,7 +956,7 @@ async def edit_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
         await update.effective_message.reply_text(
-            "Usage: /setprice PRODUCT_ID PRICE"
+            "Usage: /setprice PRODUCT_ID PRICE\nProvide an existing product ID and the new non-negative price. The updated price will apply to future orders."
         )
         return
     try:
@@ -965,7 +965,7 @@ async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except ValueError:
         await update.effective_message.reply_text(
-            "Enter a valid product ID and non-negative price."
+            "Enter a whole-number product ID and a valid price of zero or more. The price must be a numeric value without a currency symbol."
         )
         return
     with connect() as conn:
@@ -981,14 +981,14 @@ async def set_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def toggle_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
         await update.effective_message.reply_text(
-            "Usage: /hide PRODUCT_ID or /show PRODUCT_ID"
+            "Usage: /hide PRODUCT_ID or /show PRODUCT_ID\nUse /hide to remove a product from the customer shop, or /show to make it visible again."
         )
         return
     try:
         product_id = int(context.args[0])
     except ValueError:
         await update.effective_message.reply_text(
-            "Product ID must be an integer."
+            "The product ID must be a whole number. Check the ID and run the command again."
         )
         return
     active = 0 if update.effective_message.text.split()[0].split("@")[0] == "/hide" else 1
@@ -1016,7 +1016,7 @@ async def wallet_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except ValueError:
         await update.effective_message.reply_text(
-            "Enter a valid user ID and positive amount."
+            "Enter a valid numeric user ID and an adjustment amount greater than zero. Do not include the currency symbol."
         )
         return
     sign = -1 if command == "/deductfunds" else 1
@@ -1028,13 +1028,13 @@ async def wallet_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not user:
             conn.rollback()
             await update.effective_message.reply_text(
-                "User not found. They must start the bot first."
+                "No registered user was found with that ID. The user must open CaseAltBot and run /start before their wallet can be adjusted."
             )
             return
         if sign < 0 and user["balance"] < amount:
             conn.rollback()
             await update.effective_message.reply_text(
-                "User does not have enough balance."
+                "The user's current wallet balance is lower than the amount requested for deduction. No wallet adjustment was made."
             )
             return
         conn.execute(
@@ -1063,7 +1063,7 @@ async def list_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ORDER BY o.id DESC LIMIT 20
         """).fetchall()
     if not rows:
-        await update.effective_message.reply_text("No orders found.")
+        await update.effective_message.reply_text("No orders have been recorded yet. New customer orders will appear here with their order ID, amount, customer ID, and current status.")
         return
     lines = ["<b>Recent Orders</b>\nThe latest orders are listed below with their product, total value, current status, and customer ID:"]
     for order in rows:
@@ -1077,7 +1077,7 @@ async def list_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_only
 async def fulfill_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
-        await update.effective_message.reply_text("Usage: /fulfill ORDER_ID")
+        await update.effective_message.reply_text("Usage: /fulfill ORDER_ID\nProvide the ID of a pending order after you have completed its fulfilment.")
         return
     try:
         order_id = int(context.args[0])
@@ -1107,8 +1107,7 @@ async def fulfill_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             order["user_id"],
-            f"Your order #{order_id} has been marked as fulfilled. "
-            "If you need help, contact support."
+            f"Your order #{order_id} has been marked as fulfilled by the administrator. If you have a question about this order, contact GTS Network Support."
         )
     except Exception:
         log.exception(
@@ -1123,7 +1122,7 @@ async def fulfill_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
         await update.effective_message.reply_text(
-            "Usage: /cancelorder ORDER_ID"
+            "Usage: /cancelorder ORDER_ID\nProvide the ID of a pending order to cancel it, return its full amount to the customer's wallet, and release its reserved inventory number."
         )
         return
     try:
@@ -1172,8 +1171,8 @@ async def cancel_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.send_message(
             order["user_id"],
-            f"Your order #{order_id} was cancelled. "
-            f"{money(order['total'])} has been refunded."
+            f"Your order #{order_id} was cancelled by the administrator. "
+            f"The full amount of {money(order['total'])} has been returned to your wallet. The reserved inventory number has also been released."
         )
     except Exception:
         log.exception(
