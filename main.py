@@ -553,6 +553,11 @@ async def payment_method_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def payment_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID and maintenance_enabled():
+        await update.effective_message.reply_text(
+            "CaseAltBot is temporarily under maintenance. Payment requests are paused; please try again after maintenance is complete."
+        )
+        return
     state = context.user_data.get("payment_request")
     if not state:
         return
@@ -815,6 +820,9 @@ async def admin_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     q = update.callback_query
     await q.answer()
     action = q.data.split(":", 1)[1]
+    if action == "home":
+        await admin_panel(update, context)
+        return
     if action == "users":
         with connect() as conn:
             rows = conn.execute(
@@ -849,7 +857,7 @@ async def admin_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if len(lines) == 1:
         lines.append("No records found.")
     await q.edit_message_text(
-        "\\n".join(lines), parse_mode=ParseMode.HTML,
+        "\n".join(lines), parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin Dashboard", callback_data="adm:home")]])
     )
 
@@ -872,6 +880,8 @@ async def admin_quick_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         async def edit_message_text(self, *args, **kwargs):
             await update.effective_message.reply_text(*args, **kwargs)
     class FakeUpdate:
+        effective_user = update.effective_user
+        effective_message = update.effective_message
         callback_query = FakeQuery()
     await admin_list_callback(FakeUpdate(), context)
 
@@ -888,7 +898,7 @@ async def database_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(backup_path, "rb") as backup_file:
             await update.effective_message.reply_document(
                 document=backup_file, filename="casealtbot-database-backup.sqlite3",
-                caption="Encrypted account access is recommended. Store this backup securely; it contains user IDs and wallet records."
+                caption="This database backup contains user IDs, wallet balances, orders, and payment records. Store it securely and share it only with trusted administrators."
             )
     except Exception:
         log.exception("Database backup failed")
