@@ -2,6 +2,8 @@ import os
 import re
 import logging
 import sqlite3
+import shutil
+import tempfile
 from datetime import datetime, timezone
 from functools import wraps
 from io import BytesIO
@@ -44,10 +46,15 @@ def now():
 
 
 def connect():
+    # Railway persistent storage is mounted at /data; keep the DB directory present.
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -118,6 +125,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS bot_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS start_messages (
+            chat_id INTEGER PRIMARY KEY,
+            message_id INTEGER NOT NULL
         );
         """)
     log.info("Database initialized")
@@ -209,6 +220,18 @@ def admin_only(func):
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Remove the previous bot welcome/menu message so only the newest one remains.
+    chat_id = update.effective_chat.id
+    with connect() as conn:
+        previous = conn.execute(
+            "SELECT message_id FROM start_messages WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+    if previous:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=previous["message_id"])
+        except Exception:
+            log.info("Previous /start message could not be deleted for chat %s", chat_id)
+
     if update.effective_user.id != ADMIN_ID and maintenance_enabled():
         await update.effective_message.reply_text(
             f"{BOT_NAME} is temporarily unavailable while maintenance is in progress. "
@@ -221,8 +244,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<i>{BRAND}</i>\n\n"
         "Use the menu below to browse currently available products, view your wallet balance, review recent orders, or contact GTS Network Support."
     )
-    await update.effective_message.reply_text(
+    sent = await update.effective_message.reply_text(
         msg, parse_mode=ParseMode.HTML, reply_markup=main_menu()
+    )
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO start_messages(chat_id,message_id) VALUES(?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET message_id=excluded.message_id",
+            (chat_id, sent.message_id)
+        )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_text = (
+        "<b>How CaseAltBot Works</b>\n\n"
+        "CaseAltBot lets you browse available products, place orders, and manage your wallet. "
+        "Check the product price and available quantity before ordering.\n\n"
+        "<b>Wallet and payment safety</b>\n"
+        "• Adding funds is a request, not an instant credit. The administrator verifies the UPI UTR or blockchain transaction before funds are added.\n"
+        "• Your wallet is charged only when an order is successfully recorded with an available inventory number.\n"
+        "• If a pending order is cancelled by the administrator, its amount is returned to your wallet and the reserved number is released.\n"
+        "• Payment and wallet adjustments are recorded in transaction history. Never share your Telegram login code, password, or payment OTP.\n\n"
+        "<b>Need help?</b> Contact GTS Network Support using the button below. For payment questions, include your payment request or order ID.\n\n"
+        "Please note: payments are manually verified; do not treat a submitted payment request as approved until the bot confirms it."
+    )
+    await update.effective_message.reply_text(
+        help_text, parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Contact Support", url=SUPPORT_URL)],
+            [InlineKeyboardButton("Terms & Conditions", url=POLICY_URL)],
+            [InlineKeyboardButton("Open Main Menu", callback_data="home")]
+        ])
     )
 
 
@@ -501,6 +553,11 @@ async def payment_method_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def payment_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID and maintenance_enabled():
+        await update.effective_message.reply_text(
+            "CaseAltBot is temporarily under maintenance. Payment requests are paused; please try again after maintenance is complete."
+        )
+        return
     state = context.user_data.get("payment_request")
     if not state:
         return
@@ -728,28 +785,127 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "<b>CaseAltBot · Admin Dashboard</b>\n\n"
         f"Users: {users}\nActive products: {products}\n"
-        f"Available phone numbers: {stock}\nPending orders: {pending}\n"
+        f"Available numbers: {stock}\nPending orders: {pending}\n"
         f"Fulfilled order value: {money(sales)}\n"
         f"Maintenance: {'ON' if maintenance_enabled() else 'OFF'}\n\n"
-        "<b>Admin commands</b>\n"
+        "<b>Quick commands</b>\n"
+        "/users – registered users\n"
+        "/products – product list\n"
+        "/inventory – all number inventory\n"
+        "/orders – recent orders\n"
+        "/backup – download database backup\n"
+        "/help – user help text\n\n"
+        "<b>Existing management commands</b>\n"
         "/addproduct CATEGORY|NAME|DESCRIPTION|PRICE|STOCK\n"
-        "/addnumber PRODUCT_ID\n"
+        "/addnumber PRODUCT_ID – then send number\n"
         "/numbers PRODUCT_ID\n"
-        "/cancel (cancel number upload)\n"
-        "/maintenance on\n"
-        "/maintenance off\n"
-        "/editstock PRODUCT_ID DELTA\n"
+        "/maintenance on or /maintenance off\n"
         "/setprice PRODUCT_ID PRICE\n"
-        "/hide PRODUCT_ID\n"
-        "/show PRODUCT_ID\n"
-        "/addfunds USER_ID AMOUNT\n"
-        "/deductfunds USER_ID AMOUNT\n"
-        "/orders\n"
-        "/fulfill ORDER_ID\n"
-        "/cancelorder ORDER_ID\n"
+        "/hide PRODUCT_ID or /show PRODUCT_ID\n"
+        "/addfunds USER_ID AMOUNT or /deductfunds USER_ID AMOUNT\n"
+        "/fulfill ORDER_ID or /cancelorder ORDER_ID\n"
         "/creditpayment PAYMENT_ID INR_AMOUNT"
     )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Users", callback_data="adm:users"),
+         InlineKeyboardButton("Products", callback_data="adm:products")],
+        [InlineKeyboardButton("Inventory", callback_data="adm:inventory"),
+         InlineKeyboardButton("Orders", callback_data="adm:orders")],
+    ])
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+@admin_only
+async def admin_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action = q.data.split(":", 1)[1]
+    if action == "home":
+        await admin_panel(update, context)
+        return
+    if action == "users":
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT user_id, username, first_name, balance, joined_at FROM users ORDER BY joined_at DESC LIMIT 50"
+            ).fetchall()
+        lines = ["<b>Registered Users (latest 50)</b>"]
+        lines += [f"{r['first_name'] or 'User'} | ID <code>{r['user_id']}</code> | Balance {money(r['balance'])}" for r in rows]
+    elif action == "products":
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT p.id,p.name,p.category,p.price,p.active,COUNT(i.id) AS available "
+                "FROM products p LEFT JOIN inventory_numbers i ON i.product_id=p.id AND i.status='available' "
+                "GROUP BY p.id ORDER BY p.id DESC LIMIT 50"
+            ).fetchall()
+        lines = ["<b>Products (latest 50)</b>"]
+        lines += [f"#{r['id']} {r['name']} | {r['category']} | {money(r['price'])} | Available: {r['available']} | {'Active' if r['active'] else 'Hidden'}" for r in rows]
+    elif action == "inventory":
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT i.id,i.phone_number,i.status,p.name AS product_name "
+                "FROM inventory_numbers i JOIN products p ON p.id=i.product_id ORDER BY i.id DESC LIMIT 50"
+            ).fetchall()
+        lines = ["<b>Inventory (latest 50)</b>"]
+        lines += [f"#{r['id']} | {r['product_name']} | {r['phone_number']} | {r['status']}" for r in rows]
+    else:
+        with connect() as conn:
+            rows = conn.execute(
+                "SELECT id,product_name,total,status,user_id FROM orders ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+        lines = ["<b>Recent Orders (latest 20)</b>"]
+        lines += [f"#{r['id']} | {r['product_name']} | {money(r['total'])} | {r['status']} | user {r['user_id']}" for r in rows]
+    if len(lines) == 1:
+        lines.append("No records found.")
+    await q.edit_message_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Admin Dashboard", callback_data="adm:home")]])
+    )
+
+
+@admin_only
+async def admin_quick_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    command = update.effective_message.text.split()[0].split("@")[0].lower()
+    if command == "/users":
+        action = "users"
+    elif command == "/products":
+        action = "products"
+    elif command == "/inventory":
+        action = "inventory"
+    else:
+        action = "orders"
+    # Reuse the same listing logic without requiring callback data.
+    class FakeQuery:
+        data = "adm:" + action
+        async def answer(self): pass
+        async def edit_message_text(self, *args, **kwargs):
+            await update.effective_message.reply_text(*args, **kwargs)
+    class FakeUpdate:
+        effective_user = update.effective_user
+        effective_message = update.effective_message
+        callback_query = FakeQuery()
+    await admin_list_callback(FakeUpdate(), context)
+
+
+@admin_only
+async def database_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # SQLite's backup API safely includes committed WAL data in a consistent snapshot.
+    backup_path = None
+    try:
+        fd, backup_path = tempfile.mkstemp(prefix="casealtbot-backup-", suffix=".sqlite3")
+        os.close(fd)
+        with sqlite3.connect(DB_PATH) as source, sqlite3.connect(backup_path) as target:
+            source.backup(target)
+        with open(backup_path, "rb") as backup_file:
+            await update.effective_message.reply_document(
+                document=backup_file, filename="casealtbot-database-backup.sqlite3",
+                caption="This database backup contains user IDs, wallet balances, orders, and payment records. Store it securely and share it only with trusted administrators."
+            )
+    except Exception:
+        log.exception("Database backup failed")
+        await update.effective_message.reply_text("Database backup could not be created. Check Railway storage and logs.")
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            os.remove(backup_path)
 
 
 @admin_only
@@ -1191,7 +1347,12 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("admin", admin_panel))
+    app.add_handler(CommandHandler("users", admin_quick_command))
+    app.add_handler(CommandHandler("products", admin_quick_command))
+    app.add_handler(CommandHandler("inventory", admin_quick_command))
+    app.add_handler(CommandHandler("backup", database_backup))
     app.add_handler(CommandHandler("addproduct", add_product))
     app.add_handler(CommandHandler("addnumber", add_number))
     app.add_handler(CommandHandler("numbers", list_numbers))
@@ -1232,6 +1393,7 @@ def main():
         group=0,
     )
 
+    app.add_handler(CallbackQueryHandler(admin_list_callback, pattern="^adm:"))
     app.add_handler(CallbackQueryHandler(home_callback, pattern="^home$"))
     app.add_handler(CallbackQueryHandler(shop_callback, pattern="^shop$"))
     app.add_handler(CallbackQueryHandler(balance_callback, pattern="^balance$"))
