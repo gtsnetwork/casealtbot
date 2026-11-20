@@ -30,6 +30,7 @@ UPI_ID = "aman292011@fam"
 UPI_QR_DATA = "upi://pay?pa=aman292011@fam"
 USDT_BEP20_ADDRESS = "0x3979A76B7684ad7ea8BDDbafb1E1b95771391D61"
 SUPPORT_URL = "https://t.me/gtsuser"
+POLICY_URL = "https://t.me/middlegt/12"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -182,6 +183,7 @@ def main_menu():
             InlineKeyboardButton("Add Funds", callback_data="topup"),
             InlineKeyboardButton("Support", callback_data="support"),
         ],
+        [InlineKeyboardButton("Policy / Terms & Conditions", url=POLICY_URL)],
     ])
 
 
